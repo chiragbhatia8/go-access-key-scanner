@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -171,6 +172,9 @@ func main() {
 		log.Fatal("Please provide a GitHub repository URL using the -repo flag.")
 	}
 
+	// Start the timer
+	startTime := time.Now()
+
 	// Clone the repository
 	repoPath, err := cloneRepo(*repoURL)
 	if err != nil {
@@ -185,32 +189,55 @@ func main() {
 
 	validKeysFound := false
 
+	// Create a channel to communicate errors from goroutines
+	errChan := make(chan error, 1)
+
+	// Iterate over commit hashes and spawn a goroutine to search for IAM keys in each commit
 	for _, commitHash := range commitHashes {
-		// Checkout the commit
-		err := checkoutCommit(repoPath, commitHash)
-		if err != nil {
-			log.Fatalf("Error checking out commit %s: %v", commitHash, err)
-		}
+		go func(commitHash string) {
+			// Checkout the commit
+			err := checkoutCommit(repoPath, commitHash)
+			if err != nil {
+				errChan <- fmt.Errorf("error checking out commit %s: %v", commitHash, err)
+				return
+			}
 
-		// Search for IAM keys in the repository
-		foundIAMKeys, err := searchIAMKeysInRepo(repoPath)
-		if err != nil {
-			log.Fatalf("Error searching for IAM keys: %v", err)
-		}
+			// Search for IAM keys in the repository
+			foundIAMKeys, err := searchIAMKeysInRepo(repoPath)
+			if err != nil {
+				errChan <- fmt.Errorf("error searching for IAM keys in commit %s: %v", commitHash, err)
+				return
+			}
 
-		// Validate IAM keys
-		for _, iamKeys := range foundIAMKeys {
-			for accessKeyID, secretAccessKey := range iamKeys {
-				if valid := validateIAMKey(accessKeyID, secretAccessKey); valid {
-					validKeysFound = true
-					fmt.Printf("Valid IAM key found in commit %s: %s\n", commitHash, accessKeyID)
+			// Spawn a goroutine for each IAM key found in the repository to validate the key concurrently
+			for _, iamKeys := range foundIAMKeys {
+				for accessKeyID, secretAccessKey := range iamKeys {
+					go func(accessKeyID, secretAccessKey string) {
+						if valid := validateIAMKey(accessKeyID, secretAccessKey); valid {
+							validKeysFound = true
+							fmt.Printf("Valid IAM key found in commit %s: %s\n", commitHash, accessKeyID)
+						}
+					}(accessKeyID, secretAccessKey)
 				}
 			}
-		}
+		}(commitHash)
+	}
 
+	// Wait for all goroutines to finish
+	for i := 0; i < len(commitHashes); i++ {
+		select {
+		case err := <-errChan:
+			log.Fatalf("%v", err)
+		default:
+			// No errors, continue
+		}
 	}
 
 	if !validKeysFound {
 		fmt.Println("\nNo valid IAM keys found in the repository.")
 	}
+
+	duration := time.Since(startTime).Round(time.Second / 100).String()
+
+	fmt.Printf("\nTotal time taken: %v\n", duration)
 }
