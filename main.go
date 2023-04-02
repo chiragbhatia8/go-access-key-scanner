@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go/service/iam"
 )
 
 // cloneRepo clones the repository from the given URL and returns the local path to the cloned repository.
@@ -84,8 +84,8 @@ func searchIAMKeysInFile(filePath string) (map[string]string, error) {
 	}
 
 	// Regular expressions to match Access Key ID and Secret Access Key
-	accessKeyIDPattern := regexp.MustCompile(`AWS_ACCESS_KEY_ID=([A-Z0-9]+)`)
-	secretAccessKeyPattern := regexp.MustCompile(`(?i)AWS_SECRET_ACCESS_KEY=([^ \t\r\n\v\f]+)`)
+	accessKeyIDPattern := regexp.MustCompile(`(?i)(AWS_ACCESS_KEY_ID|aws_access_key_id)[=:]["']?([\w\/\+]+)["']?`)
+	secretAccessKeyPattern := regexp.MustCompile(`(?i)(AWS_SECRET_ACCESS_KEY|aws_secret_access_key)[=:]["']?([^ \t\r\n\v\f]+)["']?`)
 
 	// Find matches in the file content
 	accessKeyIDs := accessKeyIDPattern.FindAllStringSubmatch(string(content), -1)
@@ -142,25 +142,38 @@ func searchIAMKeysInRepo(repoPath string) (map[string]map[string]string, error) 
 }
 
 func validateIAMKey(accessKeyID string, secretAccessKey string) bool {
-	creds := credentials.NewStaticCredentials(accessKeyID, secretAccessKey, "")
 
 	sess, err := session.NewSession(&aws.Config{
-		Credentials: creds,
-		Region:      aws.String("ap-south-1"),
+		Region: aws.String("us-west-2")},
+	)
+
+	if err != nil {
+		return false
+	}
+
+	svc := iam.New(sess)
+
+	result, err := svc.GetAccessKeyLastUsed(&iam.GetAccessKeyLastUsedInput{
+		AccessKeyId: aws.String(accessKeyID),
 	})
-
 	if err != nil {
-		return false
+		if awsErr, ok := err.(awserr.Error); ok {
+			switch awsErr.Code() {
+			case iam.ErrCodeNoSuchEntityException:
+				return false
+			default:
+				return false
+			}
+		} else {
+			return false
+		}
 	}
 
-	stsSvc := sts.New(sess)
-	_, err = stsSvc.GetCallerIdentity(&sts.GetCallerIdentityInput{})
-
-	if err != nil {
+	if result != nil && result.UserName != nil {
+		return true
+	} else {
 		return false
 	}
-
-	return true
 }
 
 func main() {
@@ -212,6 +225,7 @@ func main() {
 			// Spawn a goroutine for each IAM key found in the repository to validate the key concurrently
 			for _, iamKeys := range foundIAMKeys {
 				for accessKeyID, secretAccessKey := range iamKeys {
+					fmt.Println(validateIAMKey(accessKeyID, secretAccessKey))
 					go func(accessKeyID, secretAccessKey string) {
 						if valid := validateIAMKey(accessKeyID, secretAccessKey); valid {
 							validKeysFound = true
